@@ -1,7 +1,7 @@
 /*
  * Microkernel for Arduino UNO R4
  * Copyright YUKARI Semiconductor Devices.
- * * Version: 20251214_01
+ * * Version: 20251228_super
  * * Update Log:
  * - Fix: Added retry logic to Task_SerialDriver to prevent input character loss during fast typing.
  * - Feature: File Write 'write <filename>:<data>'
@@ -297,36 +297,65 @@ void Task_FileMgr() {
       }
 
       else if (msg.type == MSG_FS_WRITE) {
-        bool found = false;
+  bool found = false;
 
-        char temp_payload[16];
-        strncpy(temp_payload, msg.payload, 15);
-        temp_payload[15] = '\0';
+  char temp_payload[16];
+  strncpy(temp_payload, msg.payload, 15);
+  temp_payload[15] = '\0';
 
-        char* colon = strchr(temp_payload, ':');
-        if (!colon) {
-          ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "Format Err", PID_FILE_MGR);
-          continue;
+  char* colon = strchr(temp_payload, ':');
+
+  // --- 削除処理 ---
+  if (msg.param1 == -1) {
+    for (int i = 0; i < 5; i++) {
+      if (fileSystem[i].active && strcmp(fileSystem[i].name, temp_payload) == 0) {
+        fileSystem[i].active = false;
+
+        // メモリ解放
+        ipc_send(PID_MEM_MGR, MSG_MEM_FREE_REQ, fileSystem[i].heap_addr, nullptr, PID_FILE_MGR);
+
+        // 応答待ち（省略しても動作するが確認のため）
+        Message reply;
+        while (!ipc_receive(PID_FILE_MGR, &reply)) {
+          sys_yield();
         }
 
-        *colon = '\0';
-        char* filename = temp_payload;
-        char* filedata = colon + 1;
-
-        for (int i = 0; i < 5; i++) {
-          if (fileSystem[i].active && strcmp(fileSystem[i].name, filename) == 0) {
-            strncpy(fileSystem[i].content, filedata, 31);
-            fileSystem[i].content[31] = '\0';
-            ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "Write OK", PID_FILE_MGR);
-            found = true;
-            break;
-          }
-        }
-
-        if (!found) {
-          ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Not Found", PID_FILE_MGR);
-        }
+        ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Deleted", PID_FILE_MGR);
+        found = true;
+        break;
       }
+    }
+    if (!found) {
+      ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Not Found", PID_FILE_MGR);
+    }
+    continue;
+  }
+
+  // --- 通常の書き込み処理 ---
+  if (!colon) {
+    ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "Format Err", PID_FILE_MGR);
+    continue;
+  }
+
+  *colon = '\0';
+  char* filename = temp_payload;
+  char* filedata = colon + 1;
+
+  for (int i = 0; i < 5; i++) {
+    if (fileSystem[i].active && strcmp(fileSystem[i].name, filename) == 0) {
+      strncpy(fileSystem[i].content, filedata, 31);
+      fileSystem[i].content[31] = '\0';
+      ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "Write OK", PID_FILE_MGR);
+      found = true;
+      break;
+    }
+  }
+
+  if (!found) {
+    ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Not Found", PID_FILE_MGR);
+  }
+}
+
 
     } else {
       sys_yield();
@@ -486,7 +515,19 @@ void Task_Shell() {
              }
              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, "> ", PID_SHELL); 
           }
-          
+         else if (strncmp(cmdBuffer, "heap", 4) == 0) {
+            char line[48];
+            strcpy(line, "Heap: ");
+            for (int i = 0; i < HEAP_SIZE / 32; i++) {
+            strcat(line, heap_map[i] ? "#" : ".");
+            }
+            ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, line, PID_SHELL);
+            ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, "> ", PID_SHELL);
+          }
+        else if (strncmp(cmdBuffer, "rm ", 3) == 0) {
+            ipc_send(PID_FILE_MGR, MSG_FS_WRITE, -1, &cmdBuffer[3], PID_SHELL);  // 特別なparam1で削除指示
+          }
+
           cmdIndex = 0;
         } 
         else if (cmdIndex < 31) {
@@ -649,9 +690,8 @@ void setup() {
   }
 
   Serial.println("Microkernel for Arduino UNO R4 Copyright YUKARI Semiconductor Devices.");
-  Serial.println("Version: 20251214_01");
-  Serial.println("Commands: ls, touch <name>, write <fname>:<data>, ps, blink (on|off), sleep <ms>");
-
+  Serial.println("Version: 20251228");
+  
   task_create(PID_IDLE, Task_Idle);
   task_create(PID_MEM_MGR, Task_MemMgr);
   task_create(PID_FILE_MGR, Task_FileMgr);
@@ -677,7 +717,7 @@ void setup() {
   Serial.println(mem_msg);
 
   Serial.println("YUKARI OS Booted!");
-
+  Serial.println("Commands: ls, touch <name>, write <fname>:<data>, ps, blink (on|off), sleep <ms>");
   Task_Idle();  // 無限ループに突入
 }
 
