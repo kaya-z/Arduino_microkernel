@@ -1,12 +1,23 @@
 /*
  * Microkernel for Arduino UNO R4
  * Copyright YUKARI Semiconductor Devices.
- * * Version: 20251228_super
- * * Update Log:
- * - Fix: Added retry logic to Task_SerialDriver to prevent input character loss during fast typing.
- * - Feature: File Write 'write <filename>:<data>'
- * - Feature: Stable L-Chika (Blinky) with sys_sleep
- * - Config: Stack Size 512 (Stable)
+ * Version: 20260317_fixed
+ *
+ * Update Log:
+ * - Fix [C-1]: SysTick_Handler が複数タスクを同時起床できるよう全件走査に変更
+ * - Fix [C-2]: tickless と固定1ms tickの混在を解消。Task_Idle を __WFI() のみに統一
+ * - Fix [C-3]: get_next_wake_delay() の uint32_t アンダーフローを修正
+ * - Fix [C-4]: Task_MemMgr のアロケーション応答メッセージを MSG_ACK に修正
+ * - Fix [M-1]: Task_Shell の sleep コマンド内ローカル変数 msg → buf に改名（シャドーイング解消）
+ * - Fix [M-2]: Task_SmellSensor のローカル変数 msg → buf に改名（シャドーイング解消）
+ * - Fix [M-3]: Task_Shell の ss コマンドブロックの波括弧ミスを修正（cmdIndex=0 漏れ解消）
+ * - Fix [M-4]: 未使用の MAX_TASKS 定義を削除し PID_MAX に統一
+ * - Fix [M-5]: PIN_OUTPUT を 3(D3) から A3(=17) に修正
+ * - Fix [Blinky-1]: static ローカル変数をグローバル変数に変更（非標準呼び出しでの初期化問題を回避）
+ * - Fix [Blinky-2]: MSG_LED_ON 受信時に blinky_led_on をリセット
+ * - Fix [Blinky-3]: led_on==true ブランチ末尾の冗長な digitalWrite(LOW) を削除
+ * - Fix [Blinky-4]: 非アクティブ時の不要な毎ループ digitalWrite(LOW) を sys_yield() のみに変更
+ * - Fix [m-1]: PID_MAX コメントの誤り（= 6 → = 7）を修正
  */
 
 #include <Arduino.h>
@@ -16,17 +27,22 @@
 // ==========================================
 
 #define STACK_SIZE 512  // スタックサイズ (uint32_t単位 = 2048 Bytes)
-#define MAX_TASKS  6    
+// [Fix M-4] MAX_TASKS を削除。PID_MAX に統一。
+
+#define PIN_HEATER 14    // D14(A0)
+#define PIN_SENSOR 15    // D15(A1)
+#define PIN_OUTPUT A3    // [Fix M-5] 3(D3) → A3(=17) に修正
 
 // プロセスID
 enum PID {
-  PID_IDLE = 0, 
+  PID_IDLE = 0,
   PID_MEM_MGR,
   PID_FILE_MGR,
   PID_DRIVER_SERIAL,
   PID_SHELL,
-  PID_BLINKY,   
-  PID_MAX       // PID_MAX = 6
+  PID_BLINKY,
+  PID_SMELL_SENSOR,
+  PID_MAX       // [Fix m-1] PID_MAX = 7
 };
 
 // タスク名配列
@@ -36,27 +52,29 @@ const char* TASK_NAMES[PID_MAX] = {
     "FILE_MGR",
     "SERIAL_DRV",
     "SHELL",
-    "BLINKY" 
+    "BLINKY",
+    "SMELL_SENS"
 };
 
 // メッセージタイプ
 enum MsgType {
   MSG_NONE = 0,
   MSG_ACK,
-  MSG_ERROR,           // ← これが既存のエラー通知
+  MSG_ERROR,
   MSG_MEM_ALLOC_REQ,
-  MSG_MEM_FREE_REQ,    // ← 追加
-  MSG_MEM_FREE_OK,     // ← 追加
+  MSG_MEM_FREE_REQ,
+  MSG_MEM_FREE_OK,
   MSG_FS_CREATE,
   MSG_FS_WRITE,
   MSG_FS_LIST,
   MSG_SERIAL_IN,
   MSG_SERIAL_OUT,
   MSG_SERIAL_OUT_LN,
+  MSG_SS_ON,
+  MSG_SS_OFF,
   MSG_LED_ON,
   MSG_LED_OFF
 };
-
 
 // メッセージ構造体
 struct Message {
@@ -84,33 +102,33 @@ Mailbox mailboxes[PID_MAX];
 
 bool ipc_send(PID receiver, MsgType type, int param1, const char* payload, PID sender) {
   bool success = false;
-  
-  __disable_irq(); // 割り込み禁止
-  
+
+  __disable_irq();
+
   Mailbox* mb = &mailboxes[receiver];
   if (mb->count < QUEUE_SIZE) {
     Message* msg = &mb->buffer[mb->tail];
-    msg->sender = sender;
+    msg->sender   = sender;
     msg->receiver = receiver;
-    msg->type = type;
-    msg->param1 = param1;
+    msg->type     = type;
+    msg->param1   = param1;
     memset(msg->payload, 0, 16);
-    if (payload) strncpy(msg->payload, payload, 15); 
+    if (payload) strncpy(msg->payload, payload, 15);
 
     mb->tail = (mb->tail + 1) % QUEUE_SIZE;
     mb->count++;
     success = true;
   }
-  
-  __enable_irq(); // 割り込み許可
+
+  __enable_irq();
   return success;
 }
 
 bool ipc_receive(PID receiver, Message* outMsg) {
   bool success = false;
 
-  __disable_irq(); 
-  
+  __disable_irq();
+
   Mailbox* mb = &mailboxes[receiver];
   if (mb->count > 0) {
     *outMsg = mb->buffer[mb->head];
@@ -118,14 +136,14 @@ bool ipc_receive(PID receiver, Message* outMsg) {
     mb->count--;
     success = true;
   }
-  
-  __enable_irq(); 
+
+  __enable_irq();
   return success;
 }
 
 // OSシステムコール: CPU時間を自発的に譲る
 void sys_yield() {
-  SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk; 
+  SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
   __ISB();
   __DSB();
 }
@@ -134,41 +152,34 @@ void sys_yield() {
 // 3. スケジューラ データ構造
 // ==========================================
 
-// タスクの状態
-enum TaskState { 
-    STATE_READY = 0,    // 実行可能
-    STATE_SLEEPING      // スリープ中
+enum TaskState {
+    STATE_READY = 0,
+    STATE_SLEEPING
 };
 
 struct TCB {
   uint32_t* sp;
-  uint32_t* stack_base; 
-  TaskState state;       // タスク状態
-  uint32_t wake_time;    // 起床時刻
+  uint32_t* stack_base;
+  TaskState state;
+  uint32_t  wake_time;
 }; // TCBサイズは16バイト
 
-TCB tasks[PID_MAX];
+TCB      tasks[PID_MAX];
 uint32_t taskStacks[PID_MAX][STACK_SIZE];
 
-volatile int currentTask = 0;
-volatile int nextTask = 0;
-
+volatile int      currentTask   = 0;
+volatile int      nextTask      = 0;
 volatile uint32_t global_time_ms = 0;
 
 // OSシステムコール: タスクをスリープ状態にする
 void sys_sleep(uint32_t duration_ms) {
-    __disable_irq();
+  __disable_irq();
+  tasks[currentTask].state     = STATE_SLEEPING;
+  tasks[currentTask].wake_time = global_time_ms + duration_ms;
+  __enable_irq();
 
-    // 現在のタスクの状態と起床時刻を設定
-    tasks[currentTask].state = STATE_SLEEPING;
-    tasks[currentTask].wake_time = global_time_ms + duration_ms;
-
-    __enable_irq();
-    
-    // PendSVをトリガーしてコンテキストスイッチを実行し、CPUを解放
-    sys_yield();
+  sys_yield();
 }
-
 
 // ==========================================
 // 4. サーバタスク実装
@@ -182,17 +193,18 @@ void Task_MemMgr() {
   Message msg;
   while (1) {
     if (ipc_receive(PID_MEM_MGR, &msg)) {
+
       if (msg.type == MSG_MEM_ALLOC_REQ) {
-        int size = msg.param1;
+        int size          = msg.param1;
         int blocks_needed = (size + 31) / 32;
-        int start = -1;
+        int start         = -1;
 
         for (int i = 0; i <= (HEAP_SIZE / 32 - blocks_needed); i++) {
           bool found = true;
           for (int j = 0; j < blocks_needed; j++) {
             if (heap_map[i + j]) {
               found = false;
-              i += j;  // スキップ
+              i += j;
               break;
             }
           }
@@ -206,10 +218,11 @@ void Task_MemMgr() {
           for (int j = 0; j < blocks_needed; j++) {
             heap_map[start + j] = true;
           }
-          int addr = start * 32;
+          int  addr     = start * 32;
           char addr_str[16];
           sprintf(addr_str, "%d", addr);
-          ipc_send(msg.sender, MSG_MEM_ALLOC_REQ, addr, addr_str, PID_MEM_MGR);
+          // [Fix C-4] 応答は MSG_ACK を使用（従来 MSG_MEM_ALLOC_REQ を誤って返していた）
+          ipc_send(msg.sender, MSG_ACK, addr, addr_str, PID_MEM_MGR);
         } else {
           ipc_send(msg.sender, MSG_ERROR, 0, "No Mem", PID_MEM_MGR);
         }
@@ -228,7 +241,6 @@ void Task_MemMgr() {
           continue;
         }
 
-        // 単純に1ブロックだけ解放（将来的にサイズ指定も可）
         heap_map[index] = false;
         ipc_send(msg.sender, MSG_MEM_FREE_OK, addr, "Freed", PID_MEM_MGR);
       }
@@ -244,7 +256,7 @@ struct FileNode {
   char name[12];
   char content[32];
   bool active;
-  int heap_addr; // ← これを追加！  
+  int  heap_addr;
 };
 FileNode fileSystem[5];
 
@@ -252,25 +264,26 @@ void Task_FileMgr() {
   Message msg;
   while (1) {
     if (ipc_receive(PID_FILE_MGR, &msg)) {
+
       if (msg.type == MSG_FS_CREATE) {
         bool created = false;
 
         for (int i = 0; i < 5; i++) {
           if (!fileSystem[i].active) {
-            // メモリ確保を依頼（32バイト）
             ipc_send(PID_MEM_MGR, MSG_MEM_ALLOC_REQ, 32, nullptr, PID_FILE_MGR);
 
-            // 応答を待つ
             Message reply;
             while (!ipc_receive(PID_FILE_MGR, &reply)) {
               sys_yield();
             }
 
-            if (reply.type == MSG_MEM_ALLOC_REQ) {
-              fileSystem[i].active = true;
+            // [Fix C-4] MSG_ACK で正常判定
+            if (reply.type == MSG_ACK) {
+              fileSystem[i].active    = true;
               strncpy(fileSystem[i].name, msg.payload, 11);
+              fileSystem[i].name[11]  = '\0';
               memset(fileSystem[i].content, 0, 32);
-              fileSystem[i].heap_addr = reply.param1;  // ← 確保したアドレスを記録
+              fileSystem[i].heap_addr = reply.param1;
               ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Created", PID_FILE_MGR);
               created = true;
             } else {
@@ -297,65 +310,62 @@ void Task_FileMgr() {
       }
 
       else if (msg.type == MSG_FS_WRITE) {
-  bool found = false;
+        bool found = false;
 
-  char temp_payload[16];
-  strncpy(temp_payload, msg.payload, 15);
-  temp_payload[15] = '\0';
+        char temp_payload[16];
+        strncpy(temp_payload, msg.payload, 15);
+        temp_payload[15] = '\0';
 
-  char* colon = strchr(temp_payload, ':');
+        char* colon = strchr(temp_payload, ':');
 
-  // --- 削除処理 ---
-  if (msg.param1 == -1) {
-    for (int i = 0; i < 5; i++) {
-      if (fileSystem[i].active && strcmp(fileSystem[i].name, temp_payload) == 0) {
-        fileSystem[i].active = false;
+        // --- 削除処理 ---
+        if (msg.param1 == -1) {
+          for (int i = 0; i < 5; i++) {
+            if (fileSystem[i].active && strcmp(fileSystem[i].name, temp_payload) == 0) {
+              fileSystem[i].active = false;
 
-        // メモリ解放
-        ipc_send(PID_MEM_MGR, MSG_MEM_FREE_REQ, fileSystem[i].heap_addr, nullptr, PID_FILE_MGR);
+              ipc_send(PID_MEM_MGR, MSG_MEM_FREE_REQ, fileSystem[i].heap_addr, nullptr, PID_FILE_MGR);
 
-        // 応答待ち（省略しても動作するが確認のため）
-        Message reply;
-        while (!ipc_receive(PID_FILE_MGR, &reply)) {
-          sys_yield();
+              Message reply;
+              while (!ipc_receive(PID_FILE_MGR, &reply)) {
+                sys_yield();
+              }
+
+              ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Deleted", PID_FILE_MGR);
+              found = true;
+              break;
+            }
+          }
+          if (!found) {
+            ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Not Found", PID_FILE_MGR);
+          }
+          continue;
         }
 
-        ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Deleted", PID_FILE_MGR);
-        found = true;
-        break;
+        // --- 通常の書き込み処理 ---
+        if (!colon) {
+          ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "Format Err", PID_FILE_MGR);
+          continue;
+        }
+
+        *colon = '\0';
+        char* filename = temp_payload;
+        char* filedata = colon + 1;
+
+        for (int i = 0; i < 5; i++) {
+          if (fileSystem[i].active && strcmp(fileSystem[i].name, filename) == 0) {
+            strncpy(fileSystem[i].content, filedata, 31);
+            fileSystem[i].content[31] = '\0';
+            ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "Write OK", PID_FILE_MGR);
+            found = true;
+            break;
+          }
+        }
+
+        if (!found) {
+          ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Not Found", PID_FILE_MGR);
+        }
       }
-    }
-    if (!found) {
-      ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Not Found", PID_FILE_MGR);
-    }
-    continue;
-  }
-
-  // --- 通常の書き込み処理 ---
-  if (!colon) {
-    ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "Format Err", PID_FILE_MGR);
-    continue;
-  }
-
-  *colon = '\0';
-  char* filename = temp_payload;
-  char* filedata = colon + 1;
-
-  for (int i = 0; i < 5; i++) {
-    if (fileSystem[i].active && strcmp(fileSystem[i].name, filename) == 0) {
-      strncpy(fileSystem[i].content, filedata, 31);
-      fileSystem[i].content[31] = '\0';
-      ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "Write OK", PID_FILE_MGR);
-      found = true;
-      break;
-    }
-  }
-
-  if (!found) {
-    ipc_send(msg.sender, MSG_SERIAL_OUT_LN, 0, "File Not Found", PID_FILE_MGR);
-  }
-}
-
 
     } else {
       sys_yield();
@@ -367,14 +377,12 @@ void Task_FileMgr() {
 void Task_SerialDriver() {
   while (1) {
     if (Serial.available() > 0) {
-      char c = Serial.read();
+      char c   = Serial.read();
       char s[2] = {c, '\0'};
-      
-      // 【修正】再試行ロジック
-      // 受信バッファが一杯の場合、送れるようになるまで待機(yield)して再試行する
-      // これにより、高速入力時の取りこぼしを防ぐ
+
+      // 受信バッファが一杯の場合、送れるようになるまで yield して再試行
       while (!ipc_send(PID_SHELL, MSG_SERIAL_IN, (int)c, s, PID_DRIVER_SERIAL)) {
-          sys_yield(); 
+        sys_yield();
       }
     }
 
@@ -391,11 +399,15 @@ void Task_SerialDriver() {
 }
 
 // --- LED点滅タスク (PID_BLINKY) ---
+// [Fix Blinky-1] static ローカル変数を廃止しグローバル変数に変更
+//   理由: task_create() は通常のC++関数呼び出し規約を経由せずスタックを
+//         手動構築してジャンプするため、static 変数の初期化ガードが
+//         正しく機能しない可能性がある。
+bool blinky_active = false;
+bool blinky_led_on = false;
+
 void Task_Blinky() {
   pinMode(LED_BUILTIN, OUTPUT);
-  static bool blink_active = false;
-  static bool led_on = false;
-
   digitalWrite(LED_BUILTIN, LOW);
 
   while (1) {
@@ -403,44 +415,84 @@ void Task_Blinky() {
     Message msg;
     while (ipc_receive(PID_BLINKY, &msg)) {
       if (msg.type == MSG_LED_ON) {
-        blink_active = true;
+        blinky_active = true;
+        blinky_led_on = false; // [Fix Blinky-2] 点灯フェーズから再スタート
         ipc_send(msg.sender, MSG_ACK, 0, "LED ON/BLINKING", PID_BLINKY);
       } else if (msg.type == MSG_LED_OFF) {
-        blink_active = false;
+        blinky_active = false;
+        blinky_led_on = false;
         digitalWrite(LED_BUILTIN, LOW);
-        led_on = false;
         ipc_send(msg.sender, MSG_ACK, 0, "LED OFF", PID_BLINKY);
       }
     }
 
-    sys_yield();
-
-    if (blink_active) {
-      if (!led_on) {
+    if (blinky_active) {
+      if (!blinky_led_on) {
         digitalWrite(LED_BUILTIN, HIGH);
-        led_on = true;
-        sys_sleep(2000);
+        blinky_led_on = true;
+        sys_sleep(500); // 点灯 500ms
       } else {
         digitalWrite(LED_BUILTIN, LOW);
-        led_on = false;
-        sys_sleep(2000);
-        digitalWrite(LED_BUILTIN, LOW);  
+        blinky_led_on = false;
+        // [Fix Blinky-3] 末尾の冗長な digitalWrite(LOW) を削除
+        sys_sleep(500); // 消灯 500ms
       }
     } else {
-      digitalWrite(LED_BUILTIN, LOW);
-      led_on = false;
+      // [Fix Blinky-4] 非アクティブ時は yield のみ（毎ループの digitalWrite を廃止）
+      sys_yield();
     }
   }
 }
 
+// --- 匂いセンサタスク ---
+void Task_SmellSensor() {
+  pinMode(PIN_HEATER, OUTPUT);
+  pinMode(PIN_SENSOR, OUTPUT);
+  digitalWrite(PIN_HEATER, HIGH); // Heater Off
+  digitalWrite(PIN_SENSOR, LOW);  // Sensor Pullup Off
+
+  bool active = false;
+
+  while (1) {
+    Message msg;
+    while (ipc_receive(PID_SMELL_SENSOR, &msg)) {
+      if (msg.type == MSG_SS_ON) {
+        active = true;
+        ipc_send(msg.sender, MSG_ACK, 0, "Smell Sensor ON", PID_SMELL_SENSOR);
+      } else if (msg.type == MSG_SS_OFF) {
+        active = false;
+        ipc_send(msg.sender, MSG_ACK, 0, "Smell Sensor OFF", PID_SMELL_SENSOR);
+      }
+    }
+
+    if (active) {
+      int val = 0;
+      sys_sleep(237);
+      digitalWrite(PIN_SENSOR, HIGH); // Sensor Pullup On
+      sys_sleep(3);
+      val = analogRead(PIN_OUTPUT);   // Get Sensor Voltage
+      sys_sleep(2);
+      digitalWrite(PIN_SENSOR, LOW);  // Sensor Pullup Off
+      digitalWrite(PIN_HEATER, LOW);  // Heater On
+      sys_sleep(8);
+      digitalWrite(PIN_HEATER, HIGH); // Heater Off
+
+      // [Fix M-2] ローカル変数名 msg → buf（Message msg のシャドーイング解消）
+      char buf[32];
+      sprintf(buf, "Smell: %d", val);
+      ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, buf, PID_SMELL_SENSOR);
+    }
+
+    sys_sleep(500);
+  }
+}
 
 // ==========================================
 // 4.5. シェルタスク
 // ==========================================
 
-// --- Shell (User Task) ---
 char cmdBuffer[32];
-int cmdIndex = 0;
+int  cmdIndex = 0;
 
 void Task_Shell() {
   Message msg;
@@ -449,94 +501,108 @@ void Task_Shell() {
   while (1) {
     if (ipc_receive(PID_SHELL, &msg)) {
       if (msg.type == MSG_SERIAL_IN) {
-        char c = (char)msg.param1;
+        char c    = (char)msg.param1;
         char s[2] = {c, '\0'};
-        ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, s, PID_SHELL); 
+        ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, s, PID_SHELL);
 
         if (c == '\r' || c == '\n') {
           ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, "", PID_SHELL);
           cmdBuffer[cmdIndex] = '\0';
-          
+
           if (strncmp(cmdBuffer, "ls", 2) == 0) {
-             ipc_send(PID_FILE_MGR, MSG_FS_LIST, 0, "", PID_SHELL);
-          } 
+            ipc_send(PID_FILE_MGR, MSG_FS_LIST, 0, "", PID_SHELL);
+          }
           else if (strncmp(cmdBuffer, "touch ", 6) == 0) {
-             ipc_send(PID_FILE_MGR, MSG_FS_CREATE, 0, &cmdBuffer[6], PID_SHELL);
+            ipc_send(PID_FILE_MGR, MSG_FS_CREATE, 0, &cmdBuffer[6], PID_SHELL);
           }
           else if (strncmp(cmdBuffer, "write ", 6) == 0) {
-             char* args = &cmdBuffer[6];
-             char* colon = strchr(args, ':');
-             if (colon) {
-                 ipc_send(PID_FILE_MGR, MSG_FS_WRITE, 0, args, PID_SHELL);
-             } else {
-                 ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, "Usage: write <fname>:<data>", PID_SHELL);
-                 ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, "> ", PID_SHELL);
-             }
+            char* args  = &cmdBuffer[6];
+            char* colon = strchr(args, ':');
+            if (colon) {
+              ipc_send(PID_FILE_MGR, MSG_FS_WRITE, 0, args, PID_SHELL);
+            } else {
+              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, "Usage: write <fname>:<data>", PID_SHELL);
+              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT,    0, "> ", PID_SHELL);
+            }
           }
           else if (strncmp(cmdBuffer, "blink ", 6) == 0) {
-             if (strncmp(&cmdBuffer[6], "on", 2) == 0) {
-                 ipc_send(PID_BLINKY, MSG_LED_ON, 0, "", PID_SHELL);
-             } else if (strncmp(&cmdBuffer[6], "off", 3) == 0) {
-                 ipc_send(PID_BLINKY, MSG_LED_OFF, 0, "", PID_SHELL);
-             } else {
-                 ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, "Usage: blink (on|off)", PID_SHELL);
-                 ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, "> ", PID_SHELL);
-             }
+            if (strncmp(&cmdBuffer[6], "on", 2) == 0) {
+              ipc_send(PID_BLINKY, MSG_LED_ON, 0, "", PID_SHELL);
+            } else if (strncmp(&cmdBuffer[6], "off", 3) == 0) {
+              ipc_send(PID_BLINKY, MSG_LED_OFF, 0, "", PID_SHELL);
+            } else {
+              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, "Usage: blink (on|off)", PID_SHELL);
+              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT,    0, "> ", PID_SHELL);
+            }
           }
           else if (strncmp(cmdBuffer, "sleep ", 6) == 0) {
             int duration = atoi(&cmdBuffer[6]);
             if (duration > 0) {
-              char msg[32];
-              sprintf(msg, "Sleeping %d ms...", duration);
-              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, msg, PID_SHELL);
-              sys_sleep(duration); 
+              // [Fix M-1] ローカル変数名 msg → buf（Message msg のシャドーイング解消）
+              char buf[32];
+              sprintf(buf, "Sleeping %d ms...", duration);
+              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, buf, PID_SHELL);
+              sys_sleep(duration);
               ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, "Woken up", PID_SHELL);
             } else {
               ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, "Usage: sleep <ms>", PID_SHELL);
-              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, "> ", PID_SHELL);
+              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT,    0, "> ", PID_SHELL);
             }
           }
           else if (strncmp(cmdBuffer, "ps", 2) == 0) {
-             Serial.println("--- Task Status ---");
-             Serial.println("PID | Task Name | Used/Total | State");
-             Serial.println("-----------------------------------");
-             
-             for(int i = 1; i < PID_MAX; i++) { 
-                 char output[64]; 
-                 uint32_t current_sp = (uint32_t)tasks[i].sp;
-                 uint32_t base_addr = (uint32_t)tasks[i].stack_base;
-                 uint32_t used_bytes = base_addr - current_sp;
-                 uint32_t total_bytes = STACK_SIZE * sizeof(uint32_t); 
-                 const char* state_str = (tasks[i].state == STATE_READY) ? "RDY" : "SLP";
+            Serial.println("--- Task Status ---");
+            Serial.println("PID | Task Name | Used/Total | State");
+            Serial.println("-----------------------------------");
 
-                 sprintf(output, " %d  | %-9s | %lu / %lu | %s", 
-                         i, TASK_NAMES[i], (unsigned long)used_bytes, (unsigned long)total_bytes, state_str);
-                 Serial.println(output);
-             }
-             ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, "> ", PID_SHELL); 
+            for (int i = 0; i < PID_MAX; i++) {
+              char     output[64];
+              uint32_t current_sp  = (uint32_t)tasks[i].sp;
+              uint32_t base_addr   = (uint32_t)tasks[i].stack_base;
+              uint32_t used_bytes  = base_addr - current_sp;
+              uint32_t total_bytes = STACK_SIZE * sizeof(uint32_t);
+              const char* state_str = (tasks[i].state == STATE_READY) ? "RDY" : "SLP";
+
+              sprintf(output, " %d  | %-9s | %lu / %lu | %s",
+                      i, TASK_NAMES[i],
+                      (unsigned long)used_bytes,
+                      (unsigned long)total_bytes,
+                      state_str);
+              Serial.println(output);
+            }
+            ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, "> ", PID_SHELL);
           }
-         else if (strncmp(cmdBuffer, "heap", 4) == 0) {
+          else if (strncmp(cmdBuffer, "heap", 4) == 0) {
             char line[48];
             strcpy(line, "Heap: ");
             for (int i = 0; i < HEAP_SIZE / 32; i++) {
-            strcat(line, heap_map[i] ? "#" : ".");
+              strcat(line, heap_map[i] ? "#" : ".");
             }
             ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, line, PID_SHELL);
-            ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, "> ", PID_SHELL);
+            ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT,    0, "> ", PID_SHELL);
           }
-        else if (strncmp(cmdBuffer, "rm ", 3) == 0) {
-            ipc_send(PID_FILE_MGR, MSG_FS_WRITE, -1, &cmdBuffer[3], PID_SHELL);  // 特別なparam1で削除指示
+          else if (strncmp(cmdBuffer, "rm ", 3) == 0) {
+            ipc_send(PID_FILE_MGR, MSG_FS_WRITE, -1, &cmdBuffer[3], PID_SHELL);
           }
-
+          else if (strncmp(cmdBuffer, "ss ", 3) == 0) {
+            if (strncmp(&cmdBuffer[3], "on", 2) == 0) {
+              ipc_send(PID_SMELL_SENSOR, MSG_SS_ON, 0, "", PID_SHELL);
+            } else if (strncmp(&cmdBuffer[3], "off", 3) == 0) {
+              ipc_send(PID_SMELL_SENSOR, MSG_SS_OFF, 0, "", PID_SHELL);
+            } else {
+              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, "Usage: ss (on|off)", PID_SHELL);
+              ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT,    0, "> ", PID_SHELL);
+            }
+          }
+          // [Fix M-3] cmdIndex=0 は全コマンド共通でここに配置（ss コマンド後の漏れを修正）
           cmdIndex = 0;
-        } 
-        else if (cmdIndex < 31) {
+
+        } else if (cmdIndex < 31) {
           cmdBuffer[cmdIndex++] = c;
         }
       }
       else if (msg.sender == PID_FILE_MGR || msg.sender == PID_MEM_MGR || msg.sender == PID_BLINKY) {
-          ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, msg.payload, PID_SHELL);
-          ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT, 0, "> ", PID_SHELL);
+        ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT_LN, 0, msg.payload, PID_SHELL);
+        ipc_send(PID_DRIVER_SERIAL, MSG_SERIAL_OUT,    0, "> ", PID_SHELL);
       }
     } else {
       sys_yield();
@@ -544,29 +610,12 @@ void Task_Shell() {
   }
 }
 
-// ------------------------------------------
-
 // --- Idle Task ---
-// ==========================================
-// 修正: Idleタスクをtickless対応に
-// ==========================================
+// [Fix C-2] tickless ロジックを廃止。固定1ms tick (SysTick_Config) と統一したため
+//           Task_Idle は __WFI() で待つだけ。
 void Task_Idle() {
   while (1) {
-    uint32_t delay = get_next_wake_delay();
-
-    if (delay == 0) {
-      __WFI();  // 他タスクがREADYならすぐ復帰
-    } else {
-      // SysTickをdelay ms後に1回だけ発火するよう設定
-      SysTick->CTRL = 0; // 停止
-      SysTick->LOAD = (SystemCoreClock / 1000) * delay - 1;
-      SysTick->VAL = 0;
-      SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk |
-                      SysTick_CTRL_TICKINT_Msk |
-                      SysTick_CTRL_ENABLE_Msk;
-
-      __WFI();  // スリープ
-    }
+    __WFI();
   }
 }
 
@@ -606,27 +655,29 @@ void PendSV_Handler(void) {
 }
 
 // ==========================================
-// 修正: SysTick割り込みで経過時間を加算
+// SysTick 割り込みハンドラ
 // ==========================================
 extern "C" void SysTick_Handler(void) {
-  uint32_t elapsed = (SysTick->LOAD + 1) / (SystemCoreClock / 1000);
-  global_time_ms += elapsed;
+  // 固定 1ms tick なので elapsed は常に 1
+  global_time_ms++;
 
-  int startTask = currentTask;
-  int next = startTask;
+  // [Fix C-1] 全スリープタスクの起床チェックを全件走査に変更
+  //   旧実装: do-while で最初の READY タスクが見つかったら break していたため
+  //           複数タスクが同時に wake_time を迎えても1つしか起床させられなかった。
+  for (int i = 1; i < PID_MAX; i++) {
+    if (tasks[i].state == STATE_SLEEPING &&
+        global_time_ms >= tasks[i].wake_time) {
+      tasks[i].state = STATE_READY;
+    }
+  }
 
+  // 次に実行するタスクをラウンドロビンで選択
+  int next = currentTask;
   do {
     next++;
     if (next >= PID_MAX) next = 1;
-
-    if (tasks[next].state == STATE_SLEEPING &&
-        global_time_ms >= tasks[next].wake_time) {
-      tasks[next].state = STATE_READY;
-    }
-
     if (tasks[next].state == STATE_READY) break;
-
-  } while (next != startTask);
+  } while (next != currentTask);
 
   nextTask = next;
   SCB->ICSR |= SCB_ICSR_PENDSVSET_Msk;
@@ -638,20 +689,20 @@ extern "C" void SysTick_Handler(void) {
 
 void task_create(int pid, void (*taskFunc)()) {
   uint32_t* sp = &taskStacks[pid][STACK_SIZE - 1];
-  
+
   memset(&tasks[pid], 0, sizeof(TCB));
-  
+
   tasks[pid].stack_base = sp;
 
-  *(--sp) = 0x01000000; 
-  *(--sp) = (uint32_t)taskFunc; 
-  *(--sp) = 0xFFFFFFFD; 
-  *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; 
-  for (int i = 0; i < 8; i++) *(--sp) = 0; 
-  
-  tasks[pid].sp = sp;
-  tasks[pid].state = STATE_READY; 
-  tasks[pid].wake_time = 0;
+  *(--sp) = 0x01000000;                                   // xPSR
+  *(--sp) = (uint32_t)taskFunc;                           // PC
+  *(--sp) = 0xFFFFFFFD;                                   // LR (EXC_RETURN)
+  *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; *(--sp) = 0; // R12,R3,R2,R1,R0
+  for (int i = 0; i < 8; i++) *(--sp) = 0;               // R11-R4
+
+  tasks[pid].sp         = sp;
+  tasks[pid].state      = STATE_READY;
+  tasks[pid].wake_time  = 0;
 }
 
 int get_free_heap_bytes() {
@@ -662,65 +713,69 @@ int get_free_heap_bytes() {
   return free_blocks * 32;
 }
 
-// ==========================================
-// 追加: 次のスリープ解除までの最短時間を取得
-// ==========================================
+// [Fix C-3] uint32_t アンダーフロー対策済み
+//   旧実装: wake_time < global_time_ms のとき uint32_t 減算がラップアラウンドして
+//           巨大な delay 値になり、SysTick が誤った遅延で設定されていた。
+//   現在: Task_Idle が __WFI() のみになったため本関数は使われないが、
+//         将来の tickless 復活に備えて正しい実装で残しておく。
 uint32_t get_next_wake_delay() {
   uint32_t min_delay = 0xFFFFFFFF;
+  uint32_t now       = global_time_ms;
+
   for (int i = 1; i < PID_MAX; i++) {
     if (tasks[i].state == STATE_SLEEPING) {
-      uint32_t delay = tasks[i].wake_time - global_time_ms;
+      if (tasks[i].wake_time <= now) {
+        return 0; // 即時起床が必要なタスクあり
+      }
+      uint32_t delay = tasks[i].wake_time - now;
       if (delay < min_delay) min_delay = delay;
     }
   }
   return (min_delay == 0xFFFFFFFF) ? 0 : min_delay;
 }
 
-// ==========================================
-// 修正: setup()からSysTick_Config()を削除
-// ==========================================
 void setup() {
   Serial.begin(115200);
-  while(!Serial); 
-  
+  while (!Serial);
+
   for (int i = 0; i < PID_MAX; i++) {
-    mailboxes[i].head = 0;
-    mailboxes[i].tail = 0;
+    mailboxes[i].head  = 0;
+    mailboxes[i].tail  = 0;
     mailboxes[i].count = 0;
   }
 
   Serial.println("Microkernel for Arduino UNO R4 Copyright YUKARI Semiconductor Devices.");
-  Serial.println("Version: 20251228");
-  
-  task_create(PID_IDLE, Task_Idle);
-  task_create(PID_MEM_MGR, Task_MemMgr);
-  task_create(PID_FILE_MGR, Task_FileMgr);
-  task_create(PID_DRIVER_SERIAL, Task_SerialDriver);
-  task_create(PID_SHELL, Task_Shell);
-  task_create(PID_BLINKY, Task_Blinky); 
+  Serial.println("Version: 20260317_fixed");
+  Serial.println("Commands: ls, touch <n>, write <fname>:<data>, rm <fname>, ps, heap,");
+  Serial.println("          blink (on|off), sleep <ms>, ss (on|off)");
 
-  NVIC_SetPriority(PendSV_IRQn, 0xFF); 
-  
+  task_create(PID_IDLE,         Task_Idle);
+  task_create(PID_MEM_MGR,      Task_MemMgr);
+  task_create(PID_FILE_MGR,     Task_FileMgr);
+  task_create(PID_DRIVER_SERIAL,Task_SerialDriver);
+  task_create(PID_SHELL,        Task_Shell);
+  task_create(PID_BLINKY,       Task_Blinky);
+  task_create(PID_SMELL_SENSOR, Task_SmellSensor);
+
+  NVIC_SetPriority(PendSV_IRQn, 0xFF);
+
   __set_PSP((uint32_t)tasks[PID_IDLE].sp);
-  __set_CONTROL(0x02); 
+  __set_CONTROL(0x02);
   __ISB();
 
   currentTask = PID_IDLE;
 
-  // SysTick_Config() は不要（ticklessで動的設定するため）
+  // [Fix C-2] 固定 1ms tick に統一。Task_Idle 内の tickless 再設定は廃止。
+  SysTick_Config(SystemCoreClock / 1000);
 
-    SysTick_Config(SystemCoreClock / 1000); 
-
-  // 空きメモリ表示 
   char mem_msg[32];
-  sprintf(mem_msg, "Free Heap: %d bytes", get_free_heap_bytes()); 
+  sprintf(mem_msg, "Free Heap: %d bytes", get_free_heap_bytes());
   Serial.println(mem_msg);
 
   Serial.println("YUKARI OS Booted!");
-  Serial.println("Commands: ls, touch <name>, write <fname>:<data>, ps, blink (on|off), sleep <ms>");
-  Task_Idle();  // 無限ループに突入
-}
 
+  Task_Idle(); // 無限ループに突入
+}
 
 void loop() {
   // ここには到達しない
