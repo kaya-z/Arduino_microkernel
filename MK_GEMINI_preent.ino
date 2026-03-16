@@ -399,10 +399,6 @@ void Task_SerialDriver() {
 }
 
 // --- LED点滅タスク (PID_BLINKY) ---
-// [Fix Blinky-1] static ローカル変数を廃止しグローバル変数に変更
-//   理由: task_create() は通常のC++関数呼び出し規約を経由せずスタックを
-//         手動構築してジャンプするため、static 変数の初期化ガードが
-//         正しく機能しない可能性がある。
 bool blinky_active = false;
 bool blinky_led_on = false;
 
@@ -410,13 +406,29 @@ void Task_Blinky() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, LOW);
 
+  // [Fix Blinky-r5] 絶対時刻スケジューリング方式に変更
+  //
+  // 旧実装の問題:
+  //   sys_sleep(500) は「500ms後に READY にする」だけで、
+  //   「500ms後に必ず実行される」保証がない。
+  //   起床後に他タスクが実行中だとその分待たされ、誤差が毎サイクル
+  //   積み重なって点滅間隔がずれていた。
+  //
+  // 新実装:
+  //   next_toggle に「次に切り替える絶対時刻」を記録する。
+  //   next_toggle += 500 で絶対時刻を加算することで、
+  //   仮に今回数ms遅れても次回以降に誤差が持ち越されない。
+  uint32_t next_toggle = 0;
+
   while (1) {
     // メッセージ処理
     Message msg;
     while (ipc_receive(PID_BLINKY, &msg)) {
       if (msg.type == MSG_LED_ON) {
         blinky_active = true;
-        blinky_led_on = false; // [Fix Blinky-2] 点灯フェーズから再スタート
+        blinky_led_on = true;
+        next_toggle   = global_time_ms + 500; // 今から500ms後が最初の切り替え
+        digitalWrite(LED_BUILTIN, HIGH);      // 即座に点灯
         ipc_send(msg.sender, MSG_ACK, 0, "LED ON/BLINKING", PID_BLINKY);
       } else if (msg.type == MSG_LED_OFF) {
         blinky_active = false;
@@ -427,18 +439,19 @@ void Task_Blinky() {
     }
 
     if (blinky_active) {
-      if (!blinky_led_on) {
-        digitalWrite(LED_BUILTIN, HIGH);
-        blinky_led_on = true;
-        sys_sleep(500); // 点灯 500ms
-      } else {
-        digitalWrite(LED_BUILTIN, LOW);
-        blinky_led_on = false;
-        // [Fix Blinky-3] 末尾の冗長な digitalWrite(LOW) を削除
-        sys_sleep(500); // 消灯 500ms
+      // (int32_t)キャストで uint32_t オーバーフロー時も正しく比較できる
+      if ((int32_t)(global_time_ms - next_toggle) >= 0) {
+        next_toggle += 500; // 絶対時刻で次の切り替えをスケジュール（誤差を積み重ねない）
+        if (blinky_led_on) {
+          digitalWrite(LED_BUILTIN, LOW);
+          blinky_led_on = false;
+        } else {
+          digitalWrite(LED_BUILTIN, HIGH);
+          blinky_led_on = true;
+        }
       }
+      sys_sleep(1); // 1msごとに起床して時刻チェック
     } else {
-      // [Fix Blinky-4] 非アクティブ時は yield のみ（毎ループの digitalWrite を廃止）
       sys_yield();
     }
   }
@@ -745,7 +758,7 @@ void setup() {
   }
 
   Serial.println("Microkernel for Arduino UNO R4 Copyright YUKARI Semiconductor Devices.");
-  Serial.println("Version: 20260317_fixed");
+  Serial.println("Version: 20260317_fixed_r5");
   Serial.println("Commands: ls, touch <n>, write <fname>:<data>, rm <fname>, ps, heap,");
   Serial.println("          blink (on|off), sleep <ms>, ss (on|off)");
 
